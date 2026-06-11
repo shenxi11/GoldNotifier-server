@@ -13,7 +13,13 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from datasource.finnhub_provider import FinnhubQuote, FinnhubQuoteSnapshot, build_gold_price_from_snapshot
+from datasource.finnhub_provider import (
+    FinnhubQuote,
+    FinnhubQuoteSnapshot,
+    FinnhubStreamPrice,
+    _quote_from_stream_price,
+    build_gold_price_from_snapshot,
+)
 
 
 def test_build_gold_price_from_finnhub_snapshot_matches_client_contract() -> None:
@@ -92,3 +98,20 @@ def test_build_gold_price_rejects_invalid_quote() -> None:
             stale_after_seconds=180,
             timezone_name="Asia/Shanghai",
         )
+
+
+def test_stream_price_maps_to_client_price_fields() -> None:
+    stream_price = FinnhubStreamPrice(
+        symbol="OANDA:XAU_JPY",
+        price=655432.5,
+        latest_timestamp_ms=4_077_619_200_000,
+    )
+
+    quote = _quote_from_stream_price(stream_price)
+
+    assert quote.current == 655432.5
+    assert quote.open == 655432.5
+    assert quote.prev_close == 655432.5
+    assert quote.high == 655432.5
+    assert quote.low == 655432.5
+    assert quote.latest_timestamp_ms == 4_077_619_200_000

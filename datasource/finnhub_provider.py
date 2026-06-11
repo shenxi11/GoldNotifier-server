@@ -1,22 +1,26 @@
 """
 模块名: datasource.finnhub_provider
-功能概述: 接入 Finnhub Quote 接口，并换算为人民币每克现货黄金价格。
+功能概述: 接入 Finnhub WebSocket 实时报价，并换算为人民币每克现货黄金价格。
 对外接口: FinnhubProvider、FinnhubQuoteSnapshot、build_gold_price_from_snapshot
-依赖关系: asyncio、httpx、Settings、GoldPrice
+依赖关系: asyncio、websockets、Settings、GoldPrice
 输入输出: 输入 XAU 符号和 Finnhub 报价，输出统一 GoldPrice。
-异常与错误: 凭据缺失、HTTP 异常、行情缺项和非法价格均抛出 DataSourceError。
-维护说明: 不记录 Finnhub token；open / prevClose / high / low 均来自独立字段，不再复用当前价。
+异常与错误: 凭据缺失、WebSocket 异常、行情缺项和非法价格均抛出 DataSourceError。
+维护说明: 不记录 Finnhub token；当前 Finnhub 权限只允许流式现价，OHLC 字段暂用现价填充。
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import httpx
+import websockets
+from websockets.exceptions import WebSocketException
 
 from config import Settings
 from datasource.base import DataSourceError, GoldDataSource
@@ -24,7 +28,6 @@ from model.gold_price import GoldPrice
 from utils.time_utils import is_time_stale, now_string
 
 TROY_OUNCE_GRAMS = 31.1034768
-FINNHUB_QUOTE_ENDPOINT = "https://finnhub.io/api/v1/quote"
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,15 @@ class FinnhubQuote:
 
 
 @dataclass(frozen=True)
+class FinnhubStreamPrice:
+    """Finnhub WebSocket 推送的单笔最新价格。"""
+
+    symbol: str
+    price: float
+    latest_timestamp_ms: int | None = None
+
+
+@dataclass(frozen=True)
 class FinnhubQuoteSnapshot:
     """Finnhub 换算所需的三项最新报价。"""
 
@@ -49,13 +61,18 @@ class FinnhubQuoteSnapshot:
 
 
 class FinnhubProvider(GoldDataSource):
-    """Finnhub Quote 黄金行情数据源。"""
+    """Finnhub WebSocket 黄金行情数据源。"""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        self._latest: dict[str, FinnhubStreamPrice] = {}
+        self._price_event = asyncio.Event()
+        self._stream_lock = asyncio.Lock()
+        self._stream_task: asyncio.Task[None] | None = None
+        self._last_stream_error = ""
 
     async def fetch_latest(self, symbol: str) -> GoldPrice:
-        """从 Finnhub Quote 获取最新报价并换算为元/克。"""
+        """从 Finnhub WebSocket 获取最新报价并换算为元/克。"""
 
         normalized_symbol = symbol.upper()
         if normalized_symbol != self._settings.default_symbol:
@@ -75,60 +92,141 @@ class FinnhubProvider(GoldDataSource):
             raise DataSourceError("Finnhub quotes cannot be normalized") from exc
 
     async def _collect_snapshot(self) -> FinnhubQuoteSnapshot:
-        timeout_seconds = max(1.0, self._settings.upstream_timeout_seconds)
-        try:
-            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-                xau_jpy, usd_jpy, usd_cnh = await asyncio.gather(
-                    self._fetch_quote(client, self._settings.finnhub_xau_jpy_symbol),
-                    self._fetch_quote(client, self._settings.finnhub_usd_jpy_symbol),
-                    self._fetch_quote(client, self._settings.finnhub_usd_cnh_symbol),
-                )
-        except DataSourceError:
-            raise
-        except httpx.TimeoutException as exc:
-            raise DataSourceError("Finnhub quote request timed out") from exc
-        except httpx.HTTPError as exc:
-            raise DataSourceError("Finnhub quote request failed") from exc
-        except OSError as exc:
-            raise DataSourceError("Finnhub quote connection failed") from exc
-
+        stream_prices = await self._collect_stream_prices()
         return FinnhubQuoteSnapshot(
-            xau_jpy=xau_jpy,
-            usd_jpy=usd_jpy,
-            usd_cnh=usd_cnh,
+            xau_jpy=_quote_from_stream_price(stream_prices[self._settings.finnhub_xau_jpy_symbol]),
+            usd_jpy=_quote_from_stream_price(stream_prices[self._settings.finnhub_usd_jpy_symbol]),
+            usd_cnh=_quote_from_stream_price(stream_prices[self._settings.finnhub_usd_cnh_symbol]),
         )
 
-    async def _fetch_quote(self, client: httpx.AsyncClient, finnhub_symbol: str) -> FinnhubQuote:
-        response = await client.get(
-            FINNHUB_QUOTE_ENDPOINT,
-            params={
-                "symbol": finnhub_symbol,
-                "token": self._settings.finnhub_api_key,
-            },
+    async def _collect_stream_prices(self) -> dict[str, FinnhubStreamPrice]:
+        timeout_seconds = max(1.0, self._settings.finnhub_stream_timeout_seconds)
+        unique_symbols = self._stream_symbols()
+        await self._ensure_stream_task(unique_symbols)
+
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while True:
+            snapshot = self._fresh_snapshot(unique_symbols)
+            if snapshot is not None:
+                return snapshot
+
+            await self._ensure_stream_task(unique_symbols)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                missing = [finnhub_symbol for finnhub_symbol in unique_symbols if finnhub_symbol not in self._latest]
+                detail = f"Finnhub stream timed out waiting for {', '.join(missing)}"
+                if self._last_stream_error:
+                    detail = f"{detail}: {self._last_stream_error}"
+                raise DataSourceError(detail)
+
+            self._price_event.clear()
+            try:
+                await asyncio.wait_for(self._price_event.wait(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                missing = [finnhub_symbol for finnhub_symbol in unique_symbols if finnhub_symbol not in self._latest]
+                detail = f"Finnhub stream timed out waiting for {', '.join(missing)}"
+                if self._last_stream_error:
+                    detail = f"{detail}: {self._last_stream_error}"
+                raise DataSourceError(detail) from exc
+
+    async def _ensure_stream_task(self, symbols: list[str]) -> None:
+        async with self._stream_lock:
+            if self._stream_task is None or self._stream_task.done():
+                self._stream_task = asyncio.create_task(self._run_stream(symbols))
+
+    async def _run_stream(self, symbols: list[str]) -> None:
+        retry_delay_seconds = 2.0
+        while True:
+            try:
+                async with websockets.connect(
+                    _websocket_url(self._settings.finnhub_ws_endpoint, self._settings.finnhub_api_key),
+                    ping_interval=None,
+                    close_timeout=3,
+                ) as websocket:
+                    self._last_stream_error = ""
+                    for finnhub_symbol in symbols:
+                        await websocket.send(json.dumps({"type": "subscribe", "symbol": finnhub_symbol}))
+
+                    async for message in websocket:
+                        payload = json.loads(message)
+                        message_type = payload.get("type")
+                        if message_type == "trade":
+                            _capture_trade_prices(payload.get("data"), symbols, self._latest)
+                            self._price_event.set()
+                        elif message_type == "error":
+                            self._last_stream_error = str(payload.get("msg", "unknown Finnhub stream error"))
+                            self._price_event.set()
+            except asyncio.CancelledError:
+                raise
+            except (json.JSONDecodeError, TypeError):
+                self._last_stream_error = "Finnhub stream payload is invalid"
+                self._price_event.set()
+            except (OSError, WebSocketException) as exc:
+                self._last_stream_error = f"Finnhub stream connection failed: {exc.__class__.__name__}"
+                self._price_event.set()
+
+            await asyncio.sleep(retry_delay_seconds)
+
+    def _stream_symbols(self) -> list[str]:
+        return list(
+            dict.fromkeys(
+                [
+                    self._settings.finnhub_xau_jpy_symbol,
+                    self._settings.finnhub_usd_jpy_symbol,
+                    self._settings.finnhub_usd_cnh_symbol,
+                ]
+            )
         )
-        response.raise_for_status()
 
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise DataSourceError(f"Finnhub quote payload is invalid for {finnhub_symbol}") from exc
+    def _fresh_snapshot(self, symbols: list[str]) -> dict[str, FinnhubStreamPrice] | None:
+        snapshot = {finnhub_symbol: self._latest.get(finnhub_symbol) for finnhub_symbol in symbols}
+        if any(stream_price is None for stream_price in snapshot.values()):
+            return None
 
-        current = _positive_float(payload.get("c"))
-        open_price = _positive_float(payload.get("o"))
-        prev_close = _positive_float(payload.get("pc"))
-        high = _positive_float(payload.get("h"))
-        low = _positive_float(payload.get("l"))
-        if any(value is None for value in (current, open_price, prev_close, high, low)):
-            raise DataSourceError(f"Finnhub quote payload is incomplete for {finnhub_symbol}")
+        stale_after_ms = max(self._settings.stale_after_seconds, 1) * 1000
+        now_ms = int(time.time() * 1000)
+        for stream_price in snapshot.values():
+            if stream_price is None or stream_price.latest_timestamp_ms is None:
+                return None
+            if now_ms - stream_price.latest_timestamp_ms > stale_after_ms:
+                return None
 
-        return FinnhubQuote(
-            current=current,
-            open=open_price,
-            prev_close=prev_close,
-            high=high,
-            low=low,
-            latest_timestamp_ms=_timestamp_ms(payload.get("t")),
+        return {symbol: stream_price for symbol, stream_price in snapshot.items() if stream_price is not None}
+
+
+def _capture_trade_prices(
+    trades: Any,
+    expected_symbols: list[str],
+    latest: dict[str, FinnhubStreamPrice],
+) -> None:
+    if not isinstance(trades, list):
+        return
+    expected = set(expected_symbols)
+    for trade in trades:
+        if not isinstance(trade, dict):
+            continue
+        symbol = trade.get("s")
+        if symbol not in expected:
+            continue
+        price = _positive_float(trade.get("p"))
+        if price is None:
+            continue
+        latest[symbol] = FinnhubStreamPrice(
+            symbol=symbol,
+            price=price,
+            latest_timestamp_ms=_timestamp_ms(trade.get("t")),
         )
+
+
+def _quote_from_stream_price(stream_price: FinnhubStreamPrice) -> FinnhubQuote:
+    return FinnhubQuote(
+        current=stream_price.price,
+        open=stream_price.price,
+        prev_close=stream_price.price,
+        high=stream_price.price,
+        low=stream_price.price,
+        latest_timestamp_ms=stream_price.latest_timestamp_ms,
+    )
 
 
 def build_gold_price_from_snapshot(
@@ -213,6 +311,11 @@ def _timestamp_ms(value: Any) -> int | None:
     if timestamp is None or timestamp <= 0:
         return None
     return timestamp * 1000 if timestamp < 1_000_000_000_000 else timestamp
+
+
+def _websocket_url(endpoint: str, token: str) -> str:
+    separator = "&" if "?" in endpoint else "?"
+    return f"{endpoint}{separator}{urlencode({'token': token})}"
 
 
 def _zone(timezone_name: str) -> ZoneInfo:

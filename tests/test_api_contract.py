@@ -22,8 +22,8 @@ def test_app_config_contract() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["code"] == 0
-    assert body["data"]["minRefreshInterval"] == 30
-    assert body["data"]["defaultRefreshInterval"] == 60
+    assert body["data"]["minRefreshInterval"] == 3
+    assert body["data"]["defaultRefreshInterval"] == 3
     assert body["data"]["nonTradingRefreshInterval"] == 300
 
 

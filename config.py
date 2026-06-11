@@ -70,8 +70,8 @@ class Settings:
     rate_limit_per_minute: int = 120
     log_level: str = "INFO"
     timezone: str = "Asia/Shanghai"
-    min_refresh_interval: int = 30
-    default_refresh_interval: int = 60
+    min_refresh_interval: int = 3
+    default_refresh_interval: int = 3
     latest_version_code: int = 1
     force_update: bool = False
     notice: str = ""

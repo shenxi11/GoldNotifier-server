@@ -5,7 +5,7 @@ services:
     container_name: gold-api
     restart: always
     ports:
-      - "8767:8080"
+      - "9987:8080"
     env_file:
       - .env
     environment:

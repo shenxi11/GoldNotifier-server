@@ -1,0 +1,31 @@
+services:
+  gold-api:
+    build: .
+    image: gold-api:latest
+    container_name: gold-api
+    restart: always
+    ports:
+      - "8767:8080"
+    env_file:
+      - .env
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      DATA_SOURCE: finnhub
+      DEFAULT_SYMBOL: XAU
+      FINNHUB_XAU_JPY_SYMBOL: OANDA:XAU_JPY
+      FINNHUB_USD_JPY_SYMBOL: OANDA:USD_JPY
+      FINNHUB_USD_CNH_SYMBOL: OANDA:USD_CNH
+      FINNHUB_STREAM_TIMEOUT_SECONDS: "8"
+      TZ: Asia/Shanghai
+    depends_on:
+      redis:
+        condition: service_started
+
+  redis:
+    image: redis:7
+    container_name: gold-redis
+    restart: always
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ./redis-data:/data

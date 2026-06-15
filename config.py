@@ -56,12 +56,18 @@ class Settings:
     finnhub_ws_endpoint: str = "wss://ws.finnhub.io"
     finnhub_xau_jpy_symbol: str = "OANDA:XAU_JPY"
     finnhub_usd_jpy_symbol: str = "OANDA:USD_JPY"
-    finnhub_usd_cnh_symbol: str = "OANDA:USD_CNH"
     finnhub_stream_timeout_seconds: float = 8.0
+    alpha_vantage_api_key: str = ""
+    alpha_vantage_endpoint: str = "https://www.alphavantage.co/query"
+    alpha_vantage_from_currency: str = "USD"
+    alpha_vantage_to_currency: str = "CNY"
+    alpha_vantage_cache_ttl_seconds: int = 3600
+    usd_cny_fallback_rate: float = 6.7582
     default_symbol: str = "XAU"
     redis_url: str = "redis://redis:6379/0"
     latest_cache_ttl_seconds: int = 120
     last_success_ttl_seconds: int = 86400
+    history_retention_days: int = 2
     stale_after_seconds: int = 180
     upstream_timeout_seconds: float = 8.0
     refresh_interval_seconds: int = 60
@@ -96,16 +102,32 @@ class Settings:
             finnhub_ws_endpoint=source.get("FINNHUB_WS_ENDPOINT", cls.finnhub_ws_endpoint),
             finnhub_xau_jpy_symbol=source.get("FINNHUB_XAU_JPY_SYMBOL", cls.finnhub_xau_jpy_symbol),
             finnhub_usd_jpy_symbol=source.get("FINNHUB_USD_JPY_SYMBOL", cls.finnhub_usd_jpy_symbol),
-            finnhub_usd_cnh_symbol=source.get("FINNHUB_USD_CNH_SYMBOL", cls.finnhub_usd_cnh_symbol),
+            alpha_vantage_api_key=source.get("ALPHA_VANTAGE_API_KEY", ""),
+            alpha_vantage_endpoint=source.get("ALPHA_VANTAGE_ENDPOINT", cls.alpha_vantage_endpoint),
+            alpha_vantage_from_currency=source.get(
+                "ALPHA_VANTAGE_FROM_CURRENCY",
+                cls.alpha_vantage_from_currency,
+            ).upper(),
+            alpha_vantage_to_currency=source.get(
+                "ALPHA_VANTAGE_TO_CURRENCY",
+                cls.alpha_vantage_to_currency,
+            ).upper(),
             finnhub_stream_timeout_seconds=_float_env(
                 source,
                 "FINNHUB_STREAM_TIMEOUT_SECONDS",
                 cls.finnhub_stream_timeout_seconds,
             ),
+            alpha_vantage_cache_ttl_seconds=_int_env(
+                source,
+                "ALPHA_VANTAGE_CACHE_TTL_SECONDS",
+                cls.alpha_vantage_cache_ttl_seconds,
+            ),
+            usd_cny_fallback_rate=_float_env(source, "USD_CNY_FALLBACK_RATE", cls.usd_cny_fallback_rate),
             default_symbol=source.get("DEFAULT_SYMBOL", cls.default_symbol).upper(),
             redis_url=redis_url,
             latest_cache_ttl_seconds=_int_env(source, "LATEST_CACHE_TTL_SECONDS", cls.latest_cache_ttl_seconds),
             last_success_ttl_seconds=_int_env(source, "LAST_SUCCESS_TTL_SECONDS", cls.last_success_ttl_seconds),
+            history_retention_days=_int_env(source, "HISTORY_RETENTION_DAYS", cls.history_retention_days),
             stale_after_seconds=_int_env(source, "STALE_AFTER_SECONDS", cls.stale_after_seconds),
             upstream_timeout_seconds=_float_env(source, "UPSTREAM_TIMEOUT_SECONDS", cls.upstream_timeout_seconds),
             refresh_interval_seconds=_int_env(source, "REFRESH_INTERVAL_SECONDS", cls.refresh_interval_seconds),
@@ -136,6 +158,12 @@ class Settings:
         """返回 Finnhub 凭据是否完整。"""
 
         return bool(self.finnhub_api_key)
+
+    @property
+    def alpha_vantage_configured(self) -> bool:
+        """返回 Alpha Vantage 汇率凭据是否完整。"""
+
+        return bool(self.alpha_vantage_api_key)
 
     @property
     def upstream_configured(self) -> bool:

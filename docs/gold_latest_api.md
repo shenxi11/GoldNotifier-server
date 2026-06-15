@@ -48,7 +48,9 @@
 
 ## 说明
 
-- 当前服务端已切换到 Finnhub 数据源，并使用 Finnhub WebSocket 实时流式报价。
+- 当前服务端已切换到 Finnhub 数据源，黄金/日元和美元/日元使用 Finnhub WebSocket 实时流式报价，美元/人民币汇率使用 Alpha Vantage `CURRENCY_EXCHANGE_RATE`。
 - 客户端每次请求都会触发一次上游刷新，失败时才回退最近成功缓存。
+- 成功刷新到新鲜行情时，服务端会同步追加写入当天历史行情；回退缓存不会写入历史。
 - `open`、`prevClose`、`high`、`low`、`price` 都保持数值型，便于客户端直接展示和计算。
+- 如果 Alpha Vantage 汇率临时失败，服务端会优先使用进程内最近成功美元/人民币汇率；仍不可用时使用 `USD_CNY_FALLBACK_RATE` 配置兜底，并返回 `isStale=true` 提醒客户端行情可能延迟。
 - 现有 Finnhub key 对 REST `/quote` 和 `/forex/candle` 没有权限，WebSocket 只提供实时现价。因此当前部署中 `open`、`prevClose`、`high`、`low` 会暂时与 `price` 相同；换成带 REST 外汇/贵金属权限的 key 后，服务端可恢复真实今开、昨收、最高、最低。

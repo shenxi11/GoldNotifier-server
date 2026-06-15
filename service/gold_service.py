@@ -14,10 +14,11 @@ from dataclasses import dataclass
 
 from config import Settings
 from datasource.base import DataSourceError, GoldDataSource
+from model.gold_history import GoldHistoryResponse
 from model.gold_price import GoldPrice
 from service.cache_service import RedisCacheService
 from utils.logger import get_logger
-from utils.time_utils import now_string
+from utils.time_utils import is_date_string, now_string, today_date_string
 
 logger = get_logger(__name__)
 
@@ -105,9 +106,43 @@ class GoldService:
             "dataSource": self._settings.data_source,
             "upstreamConfigured": self._settings.upstream_configured,
             "finnhubConfigured": self._settings.finnhub_configured,
+            "alphaVantageConfigured": self._settings.alpha_vantage_configured,
             "nowapiConfigured": self._settings.nowapi_configured,
             "sourceStatus": source_status,
         }
+
+    async def history(
+        self,
+        symbol: str,
+        date: str | None,
+        start_millis: int | None,
+        end_millis: int | None,
+        limit: int,
+    ) -> GoldHistoryResponse:
+        """查询指定日期或时间窗口内的历史行情点。"""
+
+        normalized_symbol = symbol.upper()
+        self._ensure_supported_symbol(normalized_symbol)
+        query_date = date or today_date_string(self._settings.timezone)
+        if not is_date_string(query_date):
+            raise GoldServiceError(f"invalid date: {query_date}", code=400)
+        if start_millis is not None and end_millis is not None and start_millis > end_millis:
+            raise GoldServiceError("startMillis must be less than or equal to endMillis", code=400)
+
+        points = await self._cache.history(
+            symbol=normalized_symbol,
+            date=query_date,
+            start_millis=start_millis,
+            end_millis=end_millis,
+            limit=limit,
+        )
+        return GoldHistoryResponse(
+            symbol=normalized_symbol,
+            date=query_date,
+            timezone=self._settings.timezone,
+            count=len(points),
+            points=points,
+        )
 
     def _ensure_supported_symbol(self, symbol: str) -> None:
         if symbol != self._settings.default_symbol:

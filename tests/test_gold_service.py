@@ -15,6 +15,7 @@ import pytest
 
 from config import Settings
 from datasource.base import DataSourceError, GoldDataSource
+from model.gold_history import GoldHistoryPoint
 from model.gold_price import GoldPrice
 from service.gold_service import GoldService, GoldServiceError
 
@@ -34,10 +35,16 @@ class FakeDataSource(GoldDataSource):
 
 
 class FakeCache:
-    def __init__(self, latest: GoldPrice | None = None, last_success: GoldPrice | None = None) -> None:
+    def __init__(
+        self,
+        latest: GoldPrice | None = None,
+        last_success: GoldPrice | None = None,
+        history_points: list[GoldHistoryPoint] | None = None,
+    ) -> None:
         self._latest = latest
         self._last_success = last_success
-        self.source_status: dict[str, Any] | None = None
+        self._history_points = history_points or []
+        self._source_status: dict[str, Any] | None = None
 
     async def latest(self, symbol: str) -> GoldPrice | None:
         return self._latest
@@ -50,10 +57,20 @@ class FakeCache:
         self._last_success = price
 
     async def mark_source_status(self, status: dict[str, Any]) -> None:
-        self.source_status = status
+        self._source_status = status
 
     async def source_status(self) -> dict[str, Any] | None:
-        return self.source_status
+        return self._source_status
+
+    async def history(
+        self,
+        symbol: str,
+        date: str,
+        start_millis: int | None,
+        end_millis: int | None,
+        limit: int,
+    ) -> list[GoldHistoryPoint]:
+        return self._history_points[:limit]
 
 
 def _price(source: str = "nowapi") -> GoldPrice:
@@ -128,3 +145,67 @@ def test_refresh_without_cache_raises_service_error() -> None:
 
     with pytest.raises(GoldServiceError):
         asyncio.run(service.refresh("XAU"))
+
+
+def test_health_reports_alpha_vantage_configuration() -> None:
+    service = GoldService(
+        datasource=FakeDataSource(price=_price(source="finnhub")),
+        cache=FakeCache(),
+        settings=Settings(
+            data_source="finnhub",
+            finnhub_api_key="finnhub-token",
+            alpha_vantage_api_key="alpha-token",
+            scheduler_enabled=False,
+        ),
+    )
+
+    result = asyncio.run(service.health())
+
+    assert result["finnhubConfigured"] is True
+    assert result["alphaVantageConfigured"] is True
+
+
+def test_history_returns_cached_points() -> None:
+    point = GoldHistoryPoint(
+        timestampMillis=4_085_190_365_000,
+        price=885.72,
+        updateTime="2099-06-11 11:39:25",
+        serverTime="2099-06-11 11:39:25",
+        source="finnhub",
+    )
+    service = GoldService(
+        datasource=FakeDataSource(error="not used"),
+        cache=FakeCache(history_points=[point]),
+        settings=Settings(scheduler_enabled=False),
+    )
+
+    result = asyncio.run(
+        service.history(
+            symbol="XAU",
+            date="2099-06-11",
+            start_millis=None,
+            end_millis=None,
+            limit=2000,
+        )
+    )
+
+    assert result.symbol == "XAU"
+    assert result.date == "2099-06-11"
+    assert result.count == 1
+    assert result.points[0].price == 885.72
+
+
+def test_history_rejects_invalid_date_and_time_window() -> None:
+    service = GoldService(
+        datasource=FakeDataSource(error="not used"),
+        cache=FakeCache(),
+        settings=Settings(scheduler_enabled=False),
+    )
+
+    with pytest.raises(GoldServiceError) as invalid_date:
+        asyncio.run(service.history("XAU", "2099/06/11", None, None, 2000))
+    assert invalid_date.value.code == 400
+
+    with pytest.raises(GoldServiceError) as invalid_window:
+        asyncio.run(service.history("XAU", "2099-06-11", 200, 100, 2000))
+    assert invalid_window.value.code == 400

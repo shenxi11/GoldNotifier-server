@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from app import create_app
 from config import Settings
+from model.gold_history import GoldHistoryPoint, GoldHistoryResponse
 
 
 def test_app_config_contract() -> None:
@@ -36,3 +37,51 @@ def test_latest_without_credentials_returns_json_error() -> None:
     body = response.json()
     assert body["code"] == 503
     assert "FINNHUB_API_KEY" in body["message"]
+
+
+def test_gold_history_contract_returns_points_and_caps_limit() -> None:
+    app = create_app(Settings(scheduler_enabled=False, rate_limit_per_minute=0))
+    app.state.gold_service = FakeHistoryService()
+    client = TestClient(app)
+
+    response = client.get("/api/v1/gold/history?symbol=XAU&date=2099-06-11&limit=20000")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["code"] == 0
+    assert body["data"]["symbol"] == "XAU"
+    assert body["data"]["date"] == "2099-06-11"
+    assert body["data"]["timezone"] == "Asia/Shanghai"
+    assert body["data"]["count"] == 1
+    assert body["data"]["points"][0]["price"] == 885.72
+    assert app.state.gold_service.last_limit == 10000
+
+
+class FakeHistoryService:
+    def __init__(self) -> None:
+        self.last_limit = 0
+
+    async def history(
+        self,
+        symbol: str,
+        date: str | None,
+        start_millis: int | None,
+        end_millis: int | None,
+        limit: int,
+    ) -> GoldHistoryResponse:
+        self.last_limit = limit
+        return GoldHistoryResponse(
+            symbol=symbol,
+            date=date or "2099-06-11",
+            timezone="Asia/Shanghai",
+            count=1,
+            points=[
+                GoldHistoryPoint(
+                    timestampMillis=4_085_190_365_000,
+                    price=885.72,
+                    updateTime="2099-06-11 11:39:25",
+                    serverTime="2099-06-11 11:39:25",
+                    source="finnhub",
+                )
+            ],
+        )

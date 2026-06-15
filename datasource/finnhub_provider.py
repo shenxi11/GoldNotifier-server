@@ -1,10 +1,10 @@
 """
 模块名: datasource.finnhub_provider
-功能概述: 接入 Finnhub WebSocket 实时报价，并换算为人民币每克现货黄金价格。
+功能概述: 接入 Finnhub WebSocket 黄金报价和 Alpha Vantage 汇率，并换算为人民币每克现货黄金价格。
 对外接口: FinnhubProvider、FinnhubQuoteSnapshot、build_gold_price_from_snapshot
-依赖关系: asyncio、websockets、Settings、GoldPrice
+依赖关系: asyncio、httpx、websockets、Settings、GoldPrice
 输入输出: 输入 XAU 符号和 Finnhub 报价，输出统一 GoldPrice。
-异常与错误: 凭据缺失、WebSocket 异常、行情缺项和非法价格均抛出 DataSourceError。
+异常与错误: 凭据缺失、WebSocket 异常、Alpha Vantage 异常、行情缺项和非法价格均抛出 DataSourceError。
 维护说明: 不记录 Finnhub token；当前 Finnhub 权限只允许流式现价，OHLC 字段暂用现价填充。
 """
 
@@ -13,21 +13,24 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import websockets
+import httpx
 from websockets.exceptions import WebSocketException
 
 from config import Settings
 from datasource.base import DataSourceError, GoldDataSource
 from model.gold_price import GoldPrice
+from utils.logger import get_logger
 from utils.time_utils import is_time_stale, now_string
 
 TROY_OUNCE_GRAMS = 31.1034768
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,7 @@ class FinnhubQuote:
     high: float
     low: float
     latest_timestamp_ms: int | None = None
+    is_stale: bool = False
 
 
 @dataclass(frozen=True)
@@ -57,7 +61,7 @@ class FinnhubQuoteSnapshot:
 
     xau_jpy: FinnhubQuote
     usd_jpy: FinnhubQuote
-    usd_cnh: FinnhubQuote
+    usd_cny: FinnhubQuote
 
 
 class FinnhubProvider(GoldDataSource):
@@ -70,6 +74,7 @@ class FinnhubProvider(GoldDataSource):
         self._stream_lock = asyncio.Lock()
         self._stream_task: asyncio.Task[None] | None = None
         self._last_stream_error = ""
+        self._usd_cny_quote_cache: FinnhubQuote | None = None
 
     async def fetch_latest(self, symbol: str) -> GoldPrice:
         """从 Finnhub WebSocket 获取最新报价并换算为元/克。"""
@@ -96,8 +101,94 @@ class FinnhubProvider(GoldDataSource):
         return FinnhubQuoteSnapshot(
             xau_jpy=_quote_from_stream_price(stream_prices[self._settings.finnhub_xau_jpy_symbol]),
             usd_jpy=_quote_from_stream_price(stream_prices[self._settings.finnhub_usd_jpy_symbol]),
-            usd_cnh=_quote_from_stream_price(stream_prices[self._settings.finnhub_usd_cnh_symbol]),
+            usd_cny=await self._usd_cny_quote(),
         )
+
+    async def _usd_cny_quote(self) -> FinnhubQuote:
+        cached = self._cached_usd_cny_quote(allow_stale=False)
+        if cached is not None:
+            return cached
+
+        try:
+            quote = await self._fetch_usd_cny_quote()
+            self._usd_cny_quote_cache = quote
+            return quote
+        except DataSourceError as exc:
+            stale_cached = self._cached_usd_cny_quote(allow_stale=True)
+            if stale_cached is not None:
+                logger.warning("Alpha Vantage USD/CNY failed, using cached rate: %s", exc)
+                throttled_cache = replace(
+                    stale_cached,
+                    latest_timestamp_ms=int(time.time() * 1000),
+                    is_stale=True,
+                )
+                self._usd_cny_quote_cache = throttled_cache
+                return throttled_cache
+
+            fallback_rate = self._settings.usd_cny_fallback_rate
+            if fallback_rate > 0:
+                logger.warning("Alpha Vantage USD/CNY failed, using configured fallback rate: %s", exc)
+                fallback_quote = FinnhubQuote(
+                    current=fallback_rate,
+                    open=fallback_rate,
+                    prev_close=fallback_rate,
+                    high=fallback_rate,
+                    low=fallback_rate,
+                    latest_timestamp_ms=int(time.time() * 1000),
+                    is_stale=True,
+                )
+                self._usd_cny_quote_cache = fallback_quote
+                return fallback_quote
+
+            raise DataSourceError("Alpha Vantage USD/CNY rate unavailable") from exc
+
+    async def _fetch_usd_cny_quote(self) -> FinnhubQuote:
+        if not self._settings.alpha_vantage_api_key:
+            raise DataSourceError("ALPHA_VANTAGE_API_KEY is required")
+        params = {
+            "function": "CURRENCY_EXCHANGE_RATE",
+            "from_currency": self._settings.alpha_vantage_from_currency,
+            "to_currency": self._settings.alpha_vantage_to_currency,
+            "apikey": self._settings.alpha_vantage_api_key,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self._settings.upstream_timeout_seconds) as client:
+                response = await client.get(self._settings.alpha_vantage_endpoint, params=params)
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.TimeoutException as exc:
+            raise DataSourceError("Alpha Vantage USD/CNY request timed out") from exc
+        except httpx.HTTPError as exc:
+            raise DataSourceError("Alpha Vantage USD/CNY request failed") from exc
+        except ValueError as exc:
+            raise DataSourceError("Alpha Vantage USD/CNY payload is invalid") from exc
+
+        rate = _extract_alpha_vantage_exchange_rate(payload)
+        if rate is None:
+            raise DataSourceError("Alpha Vantage USD/CNY rate is missing")
+
+        now_ms = int(time.time() * 1000)
+        return FinnhubQuote(
+            current=rate,
+            open=rate,
+            prev_close=rate,
+            high=rate,
+            low=rate,
+            latest_timestamp_ms=now_ms,
+        )
+
+    def _cached_usd_cny_quote(self, allow_stale: bool) -> FinnhubQuote | None:
+        cached = self._usd_cny_quote_cache
+        if cached is None:
+            return None
+        if allow_stale:
+            return cached
+        if cached.latest_timestamp_ms is None:
+            return None
+        ttl_ms = max(self._settings.alpha_vantage_cache_ttl_seconds, 1) * 1000
+        if int(time.time() * 1000) - cached.latest_timestamp_ms > ttl_ms:
+            return None
+        return cached
 
     async def _collect_stream_prices(self) -> dict[str, FinnhubStreamPrice]:
         timeout_seconds = max(1.0, self._settings.finnhub_stream_timeout_seconds)
@@ -173,7 +264,6 @@ class FinnhubProvider(GoldDataSource):
                 [
                     self._settings.finnhub_xau_jpy_symbol,
                     self._settings.finnhub_usd_jpy_symbol,
-                    self._settings.finnhub_usd_cnh_symbol,
                 ]
             )
         )
@@ -229,6 +319,17 @@ def _quote_from_stream_price(stream_price: FinnhubStreamPrice) -> FinnhubQuote:
     )
 
 
+def _extract_alpha_vantage_exchange_rate(payload: Any) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("Error Message") or payload.get("Note") or payload.get("Information"):
+        return None
+    rate_block = payload.get("Realtime Currency Exchange Rate")
+    if not isinstance(rate_block, dict):
+        return None
+    return _positive_float(rate_block.get("5. Exchange Rate"))
+
+
 def build_gold_price_from_snapshot(
     snapshot: FinnhubQuoteSnapshot,
     symbol: str,
@@ -237,26 +338,26 @@ def build_gold_price_from_snapshot(
 ) -> GoldPrice:
     """把 Finnhub 三项外汇报价换算为客户端统一金价模型。"""
 
-    price = _convert(snapshot.xau_jpy.current, snapshot.usd_jpy.current, snapshot.usd_cnh.current)
-    open_price = _convert(snapshot.xau_jpy.open, snapshot.usd_jpy.open, snapshot.usd_cnh.open)
+    price = _convert(snapshot.xau_jpy.current, snapshot.usd_jpy.current, snapshot.usd_cny.current)
+    open_price = _convert(snapshot.xau_jpy.open, snapshot.usd_jpy.open, snapshot.usd_cny.open)
     prev_close = _convert(
         snapshot.xau_jpy.prev_close,
         snapshot.usd_jpy.prev_close,
-        snapshot.usd_cnh.prev_close,
+        snapshot.usd_cny.prev_close,
     )
-    raw_high = _convert(snapshot.xau_jpy.high, snapshot.usd_jpy.high, snapshot.usd_cnh.high)
-    raw_low = _convert(snapshot.xau_jpy.low, snapshot.usd_jpy.low, snapshot.usd_cnh.low)
+    raw_high = _convert(snapshot.xau_jpy.high, snapshot.usd_jpy.high, snapshot.usd_cny.high)
+    raw_low = _convert(snapshot.xau_jpy.low, snapshot.usd_jpy.low, snapshot.usd_cny.low)
     high = round(max(price, open_price, prev_close, raw_high, raw_low), 2)
     low = round(min(price, open_price, prev_close, raw_high, raw_low), 2)
     change = round(price - prev_close, 2)
     change_percent = round((change / prev_close) * 100, 2) if prev_close > 0 else 0.0
     timestamps = [
         quote.latest_timestamp_ms
-        for quote in (snapshot.xau_jpy, snapshot.usd_jpy, snapshot.usd_cnh)
+        for quote in (snapshot.xau_jpy, snapshot.usd_jpy, snapshot.usd_cny)
         if quote.latest_timestamp_ms is not None and quote.latest_timestamp_ms > 0
     ]
     update_time = _format_timestamp_ms(max(timestamps) if timestamps else None, timezone_name)
-    is_stale = is_time_stale(update_time, stale_after_seconds, timezone_name)
+    is_stale = is_time_stale(update_time, stale_after_seconds, timezone_name) or snapshot.usd_cny.is_stale
 
     return GoldPrice(
         name="现货黄金",
@@ -283,12 +384,12 @@ def _format_timestamp_ms(timestamp_ms: int | None, timezone_name: str) -> str:
     return datetime.fromtimestamp(timestamp_ms / 1000, tz=_zone(timezone_name)).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _convert(xau_value: float, usd_jpy_value: float, usd_cnh_value: float) -> float:
-    if xau_value <= 0 or usd_jpy_value <= 0 or usd_cnh_value <= 0:
+def _convert(xau_value: float, usd_jpy_value: float, usd_cny_value: float) -> float:
+    if xau_value <= 0 or usd_jpy_value <= 0 or usd_cny_value <= 0:
         raise ValueError("Finnhub quote fields must be positive")
-    cnh_per_ounce = xau_value / usd_jpy_value * usd_cnh_value
-    cnh_per_gram = cnh_per_ounce / TROY_OUNCE_GRAMS
-    return round(cnh_per_gram, 2)
+    cny_per_ounce = xau_value / usd_jpy_value * usd_cny_value
+    cny_per_gram = cny_per_ounce / TROY_OUNCE_GRAMS
+    return round(cny_per_gram, 2)
 
 
 def _positive_float(value: Any) -> float | None:

@@ -1,9 +1,9 @@
 """
 模块名: service.cache_service
-功能概述: 封装 Redis 缓存读写，并在 Redis 不可用时让业务层可继续尝试上游。
+功能概述: 封装 Redis 最新行情、最近成功行情和当天历史行情读写。
 对外接口: RedisCacheService
-依赖关系: redis.asyncio、Settings、GoldPrice
-输入输出: 输入 GoldPrice，输出 latest 与 last_success 缓存。
+依赖关系: redis.asyncio、Settings、GoldPrice、GoldHistoryPoint
+输入输出: 输入 GoldPrice，输出 latest、last_success 与 history 缓存。
 异常与错误: Redis 异常在本层记录并返回空结果，不阻断上游刷新。
 维护说明: 缓存 JSON 字段必须保持 Android 客户端契约，不写入密钥或上游 URL。
 """
@@ -17,8 +17,10 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from config import Settings
+from model.gold_history import GoldHistoryPoint
 from model.gold_price import GoldPrice
 from utils.logger import get_logger
+from utils.time_utils import date_string_from_timestamp
 
 logger = get_logger(__name__)
 
@@ -41,7 +43,7 @@ class RedisCacheService:
         return await self._get_price(self._last_success_key(symbol))
 
     async def store_success(self, price: GoldPrice) -> None:
-        """写入 latest 与 last_success 缓存。"""
+        """写入 latest、last_success 与当天历史缓存。"""
 
         payload = price.model_dump(mode="json")
         await self._set_json(
@@ -54,6 +56,57 @@ class RedisCacheService:
             payload,
             self._settings.last_success_ttl_seconds,
         )
+        await self.append_history(price)
+
+    async def append_history(self, price: GoldPrice) -> None:
+        """把新鲜成功行情追加到当天历史 ZSet。"""
+
+        if price.isStale or price.source.lower() == "cache" or price.price <= 0:
+            return
+        point = GoldHistoryPoint.from_price(price, self._settings.timezone)
+        date = date_string_from_timestamp(point.timestampMillis, self._settings.timezone)
+        key = self._history_key(price.symbol, date)
+        try:
+            await self._client().zadd(
+                key,
+                {point.model_dump_json(): point.timestampMillis},
+            )
+            await self._client().expire(key, self._history_retention_seconds())
+        except RedisError as exc:
+            logger.warning("redis history write failed for %s: %s", key, exc.__class__.__name__)
+
+    async def history(
+        self,
+        symbol: str,
+        date: str,
+        start_millis: int | None,
+        end_millis: int | None,
+        limit: int,
+    ) -> list[GoldHistoryPoint]:
+        """读取指定日期或时间窗口的历史行情点。"""
+
+        key = self._history_key(symbol, date)
+        min_score: int | str = start_millis if start_millis is not None else "-inf"
+        max_score: int | str = end_millis if end_millis is not None else "+inf"
+        try:
+            raw_values = await self._client().zrevrangebyscore(
+                key,
+                max_score,
+                min_score,
+                start=0,
+                num=limit,
+            )
+        except RedisError as exc:
+            logger.warning("redis history read failed for %s: %s", key, exc.__class__.__name__)
+            return []
+
+        points: list[GoldHistoryPoint] = []
+        for raw_value in reversed(raw_values):
+            try:
+                points.append(GoldHistoryPoint.model_validate_json(raw_value))
+            except ValueError as exc:
+                logger.warning("invalid cached history point for %s: %s", key, exc.__class__.__name__)
+        return points
 
     async def mark_source_status(self, status: dict[str, Any]) -> None:
         """记录数据源状态，供健康检查使用。"""
@@ -123,3 +176,10 @@ class RedisCacheService:
     @staticmethod
     def _last_success_key(symbol: str) -> str:
         return f"gold:last_success:{symbol.upper()}"
+
+    @staticmethod
+    def _history_key(symbol: str, date: str) -> str:
+        return f"gold:history:{symbol.upper()}:{date}"
+
+    def _history_retention_seconds(self) -> int:
+        return max(self._settings.history_retention_days, 1) * 24 * 60 * 60

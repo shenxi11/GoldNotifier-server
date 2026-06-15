@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from api.app_config_api import router as app_config_router
+from api.gold_history_api import router as gold_history_router
 from api.gold_api import router as gold_router
 from api.health_api import router as health_router
 from config import Settings
@@ -74,6 +75,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     app.include_router(gold_router)
+    app.include_router(gold_history_router)
     app.include_router(app_config_router)
     app.include_router(health_router)
 

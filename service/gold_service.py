@@ -66,7 +66,7 @@ class GoldService:
         self._ensure_supported_symbol(normalized_symbol)
         try:
             price = await self._datasource.fetch_latest(normalized_symbol)
-            await self._cache.store_success(price)
+            price = await self._cache.store_success(price)
             await self._cache.mark_source_status(
                 {
                     "ok": True,

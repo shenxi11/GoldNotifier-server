@@ -80,13 +80,18 @@ def test_store_success_writes_latest_last_success_and_history() -> None:
     cache = _cache(fake_redis)
     price = _price(price=885.72, server_time="2099-06-11 11:39:25")
 
-    asyncio.run(cache.store_success(price))
+    result = asyncio.run(cache.store_success(price))
 
+    assert result.open == 885.72
     assert "gold:latest:XAU" in fake_redis.values
     assert "gold:last_success:XAU" in fake_redis.values
     history_key = "gold:history:XAU:2099-06-11"
     assert len(fake_redis.sorted_sets[history_key]) == 1
     assert fake_redis.expirations[history_key] == 2 * 24 * 60 * 60
+    summary = asyncio.run(cache.daily_summary("XAU", "2099-06-11"))
+    assert summary is not None
+    assert summary.close == 885.72
+    assert summary.closeTimestampMillis == _timestamp("2099-06-11 11:39:25")
     points = asyncio.run(cache.history("XAU", "2099-06-11", None, None, 2000))
     assert len(points) == 1
     assert points[0].price == 885.72
@@ -101,6 +106,30 @@ def test_store_success_skips_stale_and_cache_history_points() -> None:
     asyncio.run(cache.store_success(_price(price=885.80, is_stale=True)))
 
     assert "gold:history:XAU:2099-06-11" not in fake_redis.sorted_sets
+
+
+def test_store_success_enriches_latest_with_daily_summary_and_previous_close() -> None:
+    fake_redis = FakeRedis()
+    cache = _cache(fake_redis)
+
+    asyncio.run(cache.store_success(_price(price=879.80, server_time="2099-06-10 09:00:03")))
+    asyncio.run(cache.store_success(_price(price=881.25, server_time="2099-06-10 23:59:57")))
+    asyncio.run(cache.store_success(_price(price=885.10, server_time="2099-06-11 09:00:03")))
+    asyncio.run(cache.store_success(_price(price=887.40, server_time="2099-06-11 10:00:03")))
+    result = asyncio.run(cache.store_success(_price(price=884.50, server_time="2099-06-11 11:00:03")))
+
+    assert result.open == 885.10
+    assert result.prevClose == 881.25
+    assert result.high == 887.40
+    assert result.low == 884.50
+    assert result.change == 3.25
+    assert result.changePercent == 0.37
+    summary = asyncio.run(cache.daily_summary("XAU", "2099-06-11"))
+    assert summary is not None
+    assert summary.open == 885.10
+    assert summary.high == 887.40
+    assert summary.low == 884.50
+    assert summary.close == 884.50
 
 
 def test_history_returns_recent_limit_in_time_order_without_duplicates() -> None:

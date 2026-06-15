@@ -40,10 +40,12 @@ class FakeCache:
         latest: GoldPrice | None = None,
         last_success: GoldPrice | None = None,
         history_points: list[GoldHistoryPoint] | None = None,
+        store_success_result: GoldPrice | None = None,
     ) -> None:
         self._latest = latest
         self._last_success = last_success
         self._history_points = history_points or []
+        self._store_success_result = store_success_result
         self._source_status: dict[str, Any] | None = None
 
     async def latest(self, symbol: str) -> GoldPrice | None:
@@ -52,9 +54,11 @@ class FakeCache:
     async def last_success(self, symbol: str) -> GoldPrice | None:
         return self._last_success
 
-    async def store_success(self, price: GoldPrice) -> None:
-        self._latest = price
-        self._last_success = price
+    async def store_success(self, price: GoldPrice) -> GoldPrice:
+        result = self._store_success_result or price
+        self._latest = result
+        self._last_success = result
+        return result
 
     async def mark_source_status(self, status: dict[str, Any]) -> None:
         self._source_status = status
@@ -121,6 +125,32 @@ def test_latest_force_refresh_bypasses_short_cache() -> None:
 
     assert result.price == 886.88
     assert datasource.call_count == 1
+
+
+def test_refresh_returns_daily_enriched_cache_result() -> None:
+    upstream_price = _price(source="finnhub")
+    enriched_price = upstream_price.model_copy(
+        update={
+            "open": 880.0,
+            "prevClose": 879.0,
+            "high": 890.0,
+            "low": 878.0,
+            "change": 6.72,
+            "changePercent": 0.76,
+        }
+    )
+    service = GoldService(
+        datasource=FakeDataSource(price=upstream_price),
+        cache=FakeCache(store_success_result=enriched_price),
+        settings=Settings(scheduler_enabled=False),
+    )
+
+    result = asyncio.run(service.refresh("XAU"))
+
+    assert result.open == 880.0
+    assert result.prevClose == 879.0
+    assert result.high == 890.0
+    assert result.low == 878.0
 
 
 def test_refresh_falls_back_to_last_success_as_stale() -> None:

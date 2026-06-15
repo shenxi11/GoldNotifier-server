@@ -1,7 +1,7 @@
 """
 模块名: utils.time_utils
-功能概述: 提供服务端时间格式化、行情更新时间解析和交易状态判断。
-对外接口: now_string、now_timestamp_millis、timestamp_millis、today_date_string、date_string_from_timestamp、is_time_stale、market_status
+功能概述: 提供服务端时间格式化、行情更新时间解析、日期换算和交易状态判断。
+对外接口: now_string、now_timestamp_millis、timestamp_millis、today_date_string、date_string_from_timestamp、previous_date_string、is_time_stale、market_status
 依赖关系: datetime、zoneinfo
 输入输出: 输入时间字符串或时区名称，输出标准时间字符串与状态标记。
 异常与错误: 无法解析更新时间时按 stale 处理，避免误报新鲜数据。
@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -45,6 +45,12 @@ def date_string_from_timestamp(timestamp_millis: int, timezone_name: str) -> str
     """把 Unix 毫秒时间戳转换为指定时区日期字符串。"""
 
     return datetime.fromtimestamp(timestamp_millis / 1000, tz=_zone(timezone_name)).strftime("%Y-%m-%d")
+
+
+def previous_date_string(value: str) -> str:
+    """返回 yyyy-MM-dd 日期字符串的前一天。"""
+
+    return (datetime.strptime(value, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
 def is_date_string(value: str) -> bool:

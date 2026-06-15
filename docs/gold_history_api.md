@@ -41,6 +41,9 @@
 
 - 历史行情写入 Redis ZSet，key 为 `gold:history:{SYMBOL}:{YYYY-MM-DD}`。
 - ZSet score 使用 `timestampMillis`，value 为精简历史点 JSON。
+- 每次写入新鲜历史点后，会同步更新每日汇总 key `gold:daily_summary:{SYMBOL}:{YYYY-MM-DD}`。
+- 每日汇总保存当天第一条价格 `open`、最高价 `high`、最低价 `low` 和最后一条价格 `close`。
+- `/api/v1/gold/latest` 使用当天每日汇总计算 `open/high/low`，使用前一天每日汇总的 `close` 作为今天的 `prevClose`。
 - 只有成功刷新且 `isStale=false`、`source!="cache"`、`price>0` 的行情会进入历史。
 - 上游失败回退的缓存行情不会写入历史，避免污染趋势图。
 - 历史 key 默认保留 `2` 天，可通过 `HISTORY_RETENTION_DAYS` 调整。

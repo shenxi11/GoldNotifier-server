@@ -38,10 +38,10 @@
 ## 字段说明
 
 - `price`：当前价格
-- `open`：今开
-- `prevClose`：昨收
-- `high`：最高
-- `low`：最低
+- `open`：今开，取当天第一条服务端新鲜历史行情
+- `prevClose`：昨收，优先取前一天每日汇总的最后一条新鲜行情
+- `high`：最高，取当天服务端新鲜历史行情最高价
+- `low`：最低，取当天服务端新鲜历史行情最低价
 - `unit`：单位，固定为 `元/克`
 - `updateTime`：行情更新时间
 - `serverTime`：服务端响应时间
@@ -50,7 +50,10 @@
 
 - 当前服务端已切换到 Finnhub 数据源，黄金/日元和美元/日元使用 Finnhub WebSocket 实时流式报价，美元/人民币汇率使用 Alpha Vantage `CURRENCY_EXCHANGE_RATE`。
 - 客户端每次请求都会触发一次上游刷新，失败时才回退最近成功缓存。
-- 成功刷新到新鲜行情时，服务端会同步追加写入当天历史行情；回退缓存不会写入历史。
+- 成功刷新到新鲜行情时，服务端会同步追加写入当天历史行情，并更新当天每日汇总；回退缓存不会写入历史。
+- 每日汇总中的 `close` 会随当天最后一条新鲜行情持续覆盖更新；日期结束后，该值即作为当天收盘价记录。
+- `/latest` 返回时会用本地历史汇总覆盖上游 OHLC 兜底值：当天第一条作为 `open`，当天最高/最低作为 `high/low`，前一天 `close` 作为今天的 `prevClose`。
+- 如果前一天没有每日汇总记录，`prevClose` 会保留上游或兜底值，避免因历史缺口导致接口不可用。
 - `open`、`prevClose`、`high`、`low`、`price` 都保持数值型，便于客户端直接展示和计算。
 - 如果 Alpha Vantage 汇率临时失败，服务端会优先使用进程内最近成功美元/人民币汇率；仍不可用时使用 `USD_CNY_FALLBACK_RATE` 配置兜底，并返回 `isStale=true` 提醒客户端行情可能延迟。
-- 现有 Finnhub key 对 REST `/quote` 和 `/forex/candle` 没有权限，WebSocket 只提供实时现价。因此当前部署中 `open`、`prevClose`、`high`、`low` 会暂时与 `price` 相同；换成带 REST 外汇/贵金属权限的 key 后，服务端可恢复真实今开、昨收、最高、最低。
+- 现有 Finnhub WebSocket 只提供实时现价，服务端不再依赖 Finnhub OHLC 字段生成客户端展示用的 `open`、`prevClose`、`high`、`low`。

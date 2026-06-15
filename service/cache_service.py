@@ -119,12 +119,12 @@ class RedisCacheService:
         key = self._daily_summary_key(symbol, date)
         value = await self._get_json(key)
         if not isinstance(value, dict):
-            return None
+            return await self._build_daily_summary_from_history(symbol, date)
         try:
             return GoldDailySummary.model_validate(value)
         except ValueError as exc:
             logger.warning("invalid cached daily summary for %s: %s", key, exc.__class__.__name__)
-            return None
+            return await self._build_daily_summary_from_history(symbol, date)
 
     async def mark_source_status(self, status: dict[str, Any]) -> None:
         """记录数据源状态，供健康检查使用。"""
@@ -251,6 +251,34 @@ class RedisCacheService:
             summary.model_dump(mode="json"),
             self._history_retention_seconds(),
         )
+
+    async def _build_daily_summary_from_history(self, symbol: str, date: str) -> GoldDailySummary | None:
+        points = await self.history(
+            symbol=symbol,
+            date=date,
+            start_millis=None,
+            end_millis=None,
+            limit=100_000,
+        )
+        if not points:
+            return None
+        prices = [point.price for point in points]
+        summary = GoldDailySummary(
+            symbol=symbol.upper(),
+            date=date,
+            open=points[0].price,
+            high=max(prices),
+            low=min(prices),
+            close=points[-1].price,
+            openTimestampMillis=points[0].timestampMillis,
+            closeTimestampMillis=points[-1].timestampMillis,
+        )
+        await self._set_json(
+            self._daily_summary_key(symbol, date),
+            summary.model_dump(mode="json"),
+            self._history_retention_seconds(),
+        )
+        return summary
 
     def _date_for_price(self, price: GoldPrice, point: GoldHistoryPoint | None) -> str:
         if point is None:

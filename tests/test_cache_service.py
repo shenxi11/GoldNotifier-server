@@ -132,6 +132,25 @@ def test_store_success_enriches_latest_with_daily_summary_and_previous_close() -
     assert summary.close == 884.50
 
 
+def test_daily_summary_backfills_from_existing_history() -> None:
+    fake_redis = FakeRedis()
+    cache = _cache(fake_redis)
+
+    asyncio.run(cache.store_success(_price(price=885.10, server_time="2099-06-11 09:00:03")))
+    asyncio.run(cache.store_success(_price(price=887.40, server_time="2099-06-11 10:00:03")))
+    asyncio.run(cache.store_success(_price(price=884.50, server_time="2099-06-11 11:00:03")))
+    del fake_redis.values["gold:daily_summary:XAU:2099-06-11"]
+
+    summary = asyncio.run(cache.daily_summary("XAU", "2099-06-11"))
+
+    assert summary is not None
+    assert summary.open == 885.10
+    assert summary.high == 887.40
+    assert summary.low == 884.50
+    assert summary.close == 884.50
+    assert fake_redis.values["gold:daily_summary:XAU:2099-06-11"]
+
+
 def test_history_returns_recent_limit_in_time_order_without_duplicates() -> None:
     fake_redis = FakeRedis()
     cache = _cache(fake_redis)

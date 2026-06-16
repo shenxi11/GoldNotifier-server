@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from app import create_app
 from config import Settings
 from model.gold_history import GoldHistoryPoint, GoldHistoryResponse
+from service.gold_service import GoldServiceError
 
 
 def test_app_config_contract() -> None:
@@ -28,15 +29,25 @@ def test_app_config_contract() -> None:
     assert body["data"]["nonTradingRefreshInterval"] == 300
 
 
-def test_latest_without_credentials_returns_json_error() -> None:
-    client = TestClient(create_app(Settings(scheduler_enabled=False, rate_limit_per_minute=0)))
+def test_latest_without_cache_returns_json_error() -> None:
+    app = create_app(Settings(scheduler_enabled=False, rate_limit_per_minute=0))
+    app.state.gold_service = FakeLatestService()
+    client = TestClient(app)
 
     response = client.get("/api/v1/gold/latest?symbol=XAU")
 
     assert response.status_code == 200
     body = response.json()
     assert body["code"] == 503
-    assert "FINNHUB_API_KEY" in body["message"]
+    assert "cache is not ready" in body["message"]
+    assert app.state.gold_service.refresh_called is False
+
+
+def test_server_refresh_defaults_match_quota_plan() -> None:
+    settings = Settings()
+
+    assert settings.refresh_interval_seconds == 2
+    assert settings.latest_cache_ttl_seconds == 10
 
 
 def test_gold_history_contract_returns_points_and_caps_limit() -> None:
@@ -85,3 +96,15 @@ class FakeHistoryService:
                 )
             ],
         )
+
+
+class FakeLatestService:
+    def __init__(self) -> None:
+        self.refresh_called = False
+
+    async def latest(self, symbol: str):
+        raise GoldServiceError("latest gold cache is not ready")
+
+    async def refresh(self, symbol: str):
+        self.refresh_called = True
+        raise AssertionError("latest api must not call refresh")

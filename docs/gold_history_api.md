@@ -39,6 +39,7 @@
 
 ## 存储策略
 
+- 历史行情由服务端后台调度刷新写入，默认每 `2` 秒采集一次默认品种；客户端请求 `/latest` 不会触发写入。
 - 历史行情写入 Redis ZSet，key 为 `gold:history:{SYMBOL}:{YYYY-MM-DD}`。
 - ZSet score 使用 `timestampMillis`，value 为精简历史点 JSON。
 - 每次写入新鲜历史点后，会同步更新每日汇总 key `gold:daily_summary:{SYMBOL}:{YYYY-MM-DD}`。

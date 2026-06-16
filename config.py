@@ -65,12 +65,12 @@ class Settings:
     usd_cny_fallback_rate: float = 6.7582
     default_symbol: str = "XAU"
     redis_url: str = "redis://redis:6379/0"
-    latest_cache_ttl_seconds: int = 120
+    latest_cache_ttl_seconds: int = 10
     last_success_ttl_seconds: int = 86400
     history_retention_days: int = 2
     stale_after_seconds: int = 180
     upstream_timeout_seconds: float = 8.0
-    refresh_interval_seconds: int = 60
+    refresh_interval_seconds: int = 2
     non_trading_refresh_interval_seconds: int = 300
     scheduler_enabled: bool = True
     rate_limit_per_minute: int = 120

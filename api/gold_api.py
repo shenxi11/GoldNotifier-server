@@ -19,10 +19,10 @@ router = APIRouter(prefix="/api/v1/gold", tags=["gold"])
 
 @router.get("/latest", response_model=ApiResponse[GoldPrice])
 async def get_latest_gold(request: Request, symbol: str = "XAU") -> ApiResponse[GoldPrice]:
-    """获取最新金价；客户端请求始终主动刷新上游，失败时由服务层回退缓存。"""
+    """获取服务端缓存的最新金价；客户端请求不触发上游刷新。"""
 
     service: GoldService = request.app.state.gold_service
     try:
-        return ApiResponse.success(await service.latest(symbol, force_refresh=True))
+        return ApiResponse.success(await service.latest(symbol))
     except GoldServiceError as exc:
         return ApiResponse.error(exc.code, exc.message)

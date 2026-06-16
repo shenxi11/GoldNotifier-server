@@ -47,17 +47,25 @@ class GoldService:
         self._cache = cache
         self._settings = settings
 
-    async def latest(self, symbol: str, force_refresh: bool = False) -> GoldPrice:
-        """获取最新行情，优先使用短 TTL 缓存。"""
+    async def latest(self, symbol: str) -> GoldPrice:
+        """获取服务端已缓存的最新行情，不主动刷新上游。"""
 
         normalized_symbol = symbol.upper()
         self._ensure_supported_symbol(normalized_symbol)
-        if not force_refresh:
-            cached = await self._cache.latest(normalized_symbol)
-            if cached is not None:
-                return cached.model_copy(update={"serverTime": now_string(self._settings.timezone)})
+        cached = await self._cache.latest(normalized_symbol)
+        if cached is not None:
+            return cached.model_copy(update={"serverTime": now_string(self._settings.timezone)})
 
-        return await self.refresh(normalized_symbol)
+        fallback = await self._cache.last_success(normalized_symbol)
+        if fallback is not None:
+            return fallback.model_copy(
+                update={
+                    "source": "cache",
+                    "isStale": True,
+                    "serverTime": now_string(self._settings.timezone),
+                }
+            )
+        raise GoldServiceError("latest gold cache is not ready")
 
     async def refresh(self, symbol: str) -> GoldPrice:
         """主动刷新上游行情，并在失败时返回 last_success 缓存。"""

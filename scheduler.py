@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import Settings
@@ -40,6 +42,7 @@ class GoldRefreshScheduler:
             replace_existing=True,
             coalesce=True,
             max_instances=1,
+            next_run_time=datetime.now(self._scheduler.timezone),
         )
         self._scheduler.start()
 

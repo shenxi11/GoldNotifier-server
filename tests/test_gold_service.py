@@ -112,19 +112,36 @@ def test_latest_returns_short_cache_before_upstream() -> None:
     assert datasource.call_count == 0
 
 
-def test_latest_force_refresh_bypasses_short_cache() -> None:
-    upstream_price = _price().model_copy(update={"price": 886.88})
-    datasource = FakeDataSource(price=upstream_price)
+def test_latest_falls_back_to_last_success_without_upstream_refresh() -> None:
+    datasource = FakeDataSource(error="should not call upstream")
     service = GoldService(
         datasource=datasource,
-        cache=FakeCache(latest=_price()),
+        cache=FakeCache(last_success=_price()),
         settings=Settings(scheduler_enabled=False),
     )
 
-    result = asyncio.run(service.latest("XAU", force_refresh=True))
+    result = asyncio.run(service.latest("XAU"))
 
-    assert result.price == 886.88
-    assert datasource.call_count == 1
+    assert result.price == 885.72
+    assert result.source == "cache"
+    assert result.isStale is True
+    assert datasource.call_count == 0
+
+
+def test_latest_without_cache_raises_without_upstream_refresh() -> None:
+    datasource = FakeDataSource(price=_price())
+    service = GoldService(
+        datasource=datasource,
+        cache=FakeCache(),
+        settings=Settings(scheduler_enabled=False),
+    )
+
+    with pytest.raises(GoldServiceError) as exc:
+        asyncio.run(service.latest("XAU"))
+
+    assert exc.value.code == 503
+    assert "cache is not ready" in exc.value.message
+    assert datasource.call_count == 0
 
 
 def test_refresh_returns_daily_enriched_cache_result() -> None:

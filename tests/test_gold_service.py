@@ -18,6 +18,7 @@ from datasource.base import DataSourceError, GoldDataSource
 from model.gold_history import GoldHistoryPoint
 from model.gold_price import GoldPrice
 from service.gold_service import GoldService, GoldServiceError
+from utils.time_utils import now_timestamp_millis
 
 
 class FakeDataSource(GoldDataSource):
@@ -256,3 +257,53 @@ def test_history_rejects_invalid_date_and_time_window() -> None:
     with pytest.raises(GoldServiceError) as invalid_window:
         asyncio.run(service.history("XAU", "2099-06-11", 200, 100, 2000))
     assert invalid_window.value.code == 400
+
+
+def test_candles_aggregates_history_points_to_ohlc() -> None:
+    bucket_start = (now_timestamp_millis("Asia/Shanghai") // 60_000 - 1) * 60_000
+    points = [
+        _history_point(bucket_start + 5_000, 885.10),
+        _history_point(bucket_start + 15_000, 886.25),
+        _history_point(bucket_start + 35_000, 884.95),
+        _history_point(bucket_start + 45_000, 885.80),
+    ]
+    service = GoldService(
+        datasource=FakeDataSource(error="not used"),
+        cache=FakeCache(history_points=points),
+        settings=Settings(scheduler_enabled=False, timezone="Asia/Shanghai"),
+    )
+
+    result = asyncio.run(service.candles("XAU", "1h"))
+
+    assert result.symbol == "XAU"
+    assert result.range == "1h"
+    assert result.resolution == "1m"
+    assert result.count == 1
+    assert result.bars[0].timestampMillis == bucket_start
+    assert result.bars[0].open == 885.10
+    assert result.bars[0].high == 886.25
+    assert result.bars[0].low == 884.95
+    assert result.bars[0].close == 885.80
+
+
+def test_candles_rejects_unsupported_range() -> None:
+    service = GoldService(
+        datasource=FakeDataSource(error="not used"),
+        cache=FakeCache(),
+        settings=Settings(scheduler_enabled=False),
+    )
+
+    with pytest.raises(GoldServiceError) as exc:
+        asyncio.run(service.candles("XAU", "30m"))
+
+    assert exc.value.code == 400
+
+
+def _history_point(timestamp_millis: int, price: float) -> GoldHistoryPoint:
+    return GoldHistoryPoint(
+        timestampMillis=timestamp_millis,
+        price=price,
+        updateTime="2026-06-16 00:00:00",
+        serverTime="2026-06-16 00:00:00",
+        source="finnhub",
+    )

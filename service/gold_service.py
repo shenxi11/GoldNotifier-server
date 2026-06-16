@@ -12,15 +12,35 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from config import Settings
 from datasource.base import DataSourceError, GoldDataSource
-from model.gold_history import GoldHistoryResponse
+from model.gold_history import GoldCandleBar, GoldCandlesResponse, GoldHistoryPoint, GoldHistoryResponse
 from model.gold_price import GoldPrice
 from service.cache_service import RedisCacheService
 from utils.logger import get_logger
-from utils.time_utils import is_date_string, now_string, today_date_string
+from utils.time_utils import is_date_string, now_string, now_timestamp_millis, today_date_string
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class CandleResolution:
+    """K 线时间窗口与聚合粒度配置。"""
+
+    window_millis: int
+    bucket_millis: int
+    label: str
+
+
+CANDLE_RESOLUTIONS: dict[str, CandleResolution] = {
+    "5m": CandleResolution(window_millis=5 * 60_000, bucket_millis=15_000, label="15s"),
+    "1h": CandleResolution(window_millis=60 * 60_000, bucket_millis=60_000, label="1m"),
+    "6h": CandleResolution(window_millis=6 * 60 * 60_000, bucket_millis=5 * 60_000, label="5m"),
+    "1d": CandleResolution(window_millis=24 * 60 * 60_000, bucket_millis=15 * 60_000, label="15m"),
+}
 
 
 @dataclass
@@ -152,6 +172,115 @@ class GoldService:
             points=points,
         )
 
+    async def candles(
+        self,
+        symbol: str,
+        range_name: str,
+    ) -> GoldCandlesResponse:
+        """按当前时间窗口把历史点聚合为 TradingView K 线。"""
+
+        normalized_symbol = symbol.upper()
+        self._ensure_supported_symbol(normalized_symbol)
+        resolution = CANDLE_RESOLUTIONS.get(range_name)
+        if resolution is None:
+            supported = ", ".join(CANDLE_RESOLUTIONS.keys())
+            raise GoldServiceError(f"unsupported range: {range_name}. supported: {supported}", code=400)
+
+        end_millis = now_timestamp_millis(self._settings.timezone)
+        start_millis = end_millis - resolution.window_millis
+        points = await self._history_points_between(
+            symbol=normalized_symbol,
+            start_millis=start_millis,
+            end_millis=end_millis,
+        )
+        bars = self._aggregate_candles(
+            points=points,
+            start_millis=start_millis,
+            end_millis=end_millis,
+            bucket_millis=resolution.bucket_millis,
+        )
+        return GoldCandlesResponse(
+            symbol=normalized_symbol,
+            range=range_name,
+            resolution=resolution.label,
+            timezone=self._settings.timezone,
+            count=len(bars),
+            bars=bars,
+        )
+
     def _ensure_supported_symbol(self, symbol: str) -> None:
         if symbol != self._settings.default_symbol:
             raise GoldServiceError(f"unsupported symbol: {symbol}", code=400)
+
+    async def _history_points_between(
+        self,
+        symbol: str,
+        start_millis: int,
+        end_millis: int,
+    ) -> list[GoldHistoryPoint]:
+        points: list[GoldHistoryPoint] = []
+        for date in self._dates_between(start_millis, end_millis):
+            points.extend(
+                await self._cache.history(
+                    symbol=symbol,
+                    date=date,
+                    start_millis=start_millis,
+                    end_millis=end_millis,
+                    limit=100_000,
+                )
+            )
+        return sorted(
+            {
+                point.timestampMillis: point
+                for point in points
+                if start_millis <= point.timestampMillis <= end_millis and point.price > 0.0
+            }.values(),
+            key=lambda point: point.timestampMillis,
+        )
+
+    def _aggregate_candles(
+        self,
+        points: list[GoldHistoryPoint],
+        start_millis: int,
+        end_millis: int,
+        bucket_millis: int,
+    ) -> list[GoldCandleBar]:
+        bars_by_bucket: dict[int, GoldCandleBar] = {}
+        for point in points:
+            if point.timestampMillis < start_millis or point.timestampMillis > end_millis:
+                continue
+            bucket_start = point.timestampMillis - point.timestampMillis % bucket_millis
+            current = bars_by_bucket.get(bucket_start)
+            if current is None:
+                bars_by_bucket[bucket_start] = GoldCandleBar(
+                    timestampMillis=bucket_start,
+                    open=point.price,
+                    high=point.price,
+                    low=point.price,
+                    close=point.price,
+                )
+            else:
+                bars_by_bucket[bucket_start] = current.model_copy(
+                    update={
+                        "high": max(current.high, point.price),
+                        "low": min(current.low, point.price),
+                        "close": point.price,
+                    }
+                )
+        return [bars_by_bucket[key] for key in sorted(bars_by_bucket.keys())]
+
+    def _dates_between(self, start_millis: int, end_millis: int) -> list[str]:
+        start_date = datetime.fromtimestamp(start_millis / 1000, tz=self._zone()).date()
+        end_date = datetime.fromtimestamp(end_millis / 1000, tz=self._zone()).date()
+        dates: list[str] = []
+        current = start_date
+        while current <= end_date:
+            dates.append(current.strftime("%Y-%m-%d"))
+            current += timedelta(days=1)
+        return dates
+
+    def _zone(self) -> ZoneInfo:
+        try:
+            return ZoneInfo(self._settings.timezone)
+        except ZoneInfoNotFoundError:
+            return ZoneInfo("Asia/Shanghai")

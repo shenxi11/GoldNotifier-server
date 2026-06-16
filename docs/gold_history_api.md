@@ -1,4 +1,4 @@
-# `/api/v1/gold/history` 接口说明
+# `/api/v1/gold/history` 与 `/api/v1/gold/candles` 接口说明
 
 ## 请求
 
@@ -56,3 +56,52 @@
 - 本接口只读取服务端已经采集到的新鲜行情点，不主动刷新第三方上游。
 - 空历史返回 `code=0`、`count=0` 和空数组。
 - 当前只支持默认品种 `XAU`，其他 symbol 会返回业务错误。
+
+## K 线接口
+
+### 请求
+
+- Method: `GET`
+- Path: `/api/v1/gold/candles`
+- Query:
+  - `symbol`：行情标识，当前默认仅支持 `XAU`
+  - `range`：趋势窗口，支持 `5m`、`1h`、`6h`、`1d`
+
+### 聚合粒度
+
+- `5m`：按 `15s` 聚合。
+- `1h`：按 `1m` 聚合。
+- `6h`：按 `5m` 聚合。
+- `1d`：按 `15m` 聚合。
+
+### 响应结构
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "symbol": "XAU",
+    "range": "1h",
+    "resolution": "1m",
+    "timezone": "Asia/Shanghai",
+    "count": 1,
+    "bars": [
+      {
+        "timestampMillis": 1781519700000,
+        "open": 943.02,
+        "high": 943.18,
+        "low": 942.96,
+        "close": 943.08
+      }
+    ]
+  }
+}
+```
+
+### K 线口径
+
+- 本接口只从 Redis 历史点读取数据，不主动刷新上游。
+- 每根 K 线按周期起点聚合，第一条为 `open`，最高为 `high`，最低为 `low`，最后一条为 `close`。
+- 当前未结束的周期会返回并随服务端后台刷新继续变化。
+- 空周期不补假数据，避免展示不存在的行情。

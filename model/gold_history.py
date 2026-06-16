@@ -1,7 +1,7 @@
 """
 模块名: gold_history
 功能概述: 定义服务端历史行情查询接口使用的精简点位模型和每日汇总模型。
-对外接口: GoldHistoryPoint、GoldHistoryResponse、GoldDailySummary
+对外接口: GoldHistoryPoint、GoldHistoryResponse、GoldDailySummary、GoldCandleBar、GoldCandlesResponse
 依赖关系: Pydantic、GoldPrice、utils.time_utils
 输入输出: 输入成功刷新的 GoldPrice，输出可写入 Redis ZSet 和返回给客户端的历史点。
 异常与错误: 时间解析失败时回退服务端当前时间，避免一次异常行情破坏写入链路。
@@ -64,3 +64,24 @@ class GoldDailySummary(BaseModel):
     close: float = Field(description="当天最后一条有效行情价格。")
     openTimestampMillis: int
     closeTimestampMillis: int
+
+
+class GoldCandleBar(BaseModel):
+    """按固定周期聚合后的 OHLC K 线。"""
+
+    timestampMillis: int = Field(description="K 线周期起点，Unix 毫秒时间戳。")
+    open: float
+    high: float
+    low: float
+    close: float
+
+
+class GoldCandlesResponse(BaseModel):
+    """K 线查询响应数据。"""
+
+    symbol: str
+    range: str
+    resolution: str
+    timezone: str
+    count: int
+    bars: list[GoldCandleBar]
